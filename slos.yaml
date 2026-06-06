@@ -1,0 +1,138 @@
+service: vision-moderation
+description: >
+  Internal SLOs for the Vision Moderation API.
+  The availability SLO (0.997) is deliberately stricter than the external
+  partner SLA (0.995) to give the team an error budget that triggers
+  remediation before the contractual refund threshold is breached.
+
+slos:
+  - name: availability
+    description: >
+      Tracks the proportion of requests that result in a successful response.
+      Tied directly to the partner SLA: 99.5% availability over a rolling
+      30-day window, with refunds triggered on breach. Internal objective
+      is set to 99.7% — 0.2 pp stricter — so the team pages and remediates
+      before the external SLA is at risk.
+    sli:
+      type: request_based
+      good_request: >
+        HTTP response status code is 2xx (200 or 202).
+        Requests that time out at the client or receive a 5xx response
+        are counted as bad. 4xx responses (client error) are excluded
+        from the SLI denominator entirely — they do not reflect service health.
+      metric: |
+        sum(rate(http_requests_total{status=~"2xx"}[window]))
+        /
+        sum(rate(http_requests_total{status!~"4xx"}[window]))
+    objective: 0.997           # internal; stricter than the 0.995 partner SLA
+    window: 30d
+    error_budget_minutes_per_month: 129   # (1 - 0.997) * 30 * 24 * 60
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4        # exhausts 30-day budget in ~50 hours
+        window: 1h
+        annotation: "Fast burn: availability dropping sharply. Page on-call immediately."
+      - severity: page
+        burn_rate: 6
+        window: 6h
+        annotation: "Moderate burn over 6h: investigate before budget is critically low."
+      - severity: ticket
+        burn_rate: 3
+        window: 72h
+        annotation: "Slow burn: open a ticket, review in next business day."
+
+  - name: latency_p95_sync
+    description: >
+      95% of synchronous /v1/predict requests must complete end-to-end
+      in under 250 ms. This covers 90% of total traffic.
+      Exceeding 500 ms p95 over a rolling hour triggers partner SLA refunds.
+    sli:
+      type: request_based
+      good_request: >
+        A synchronous POST /v1/predict request whose total end-to-end
+        latency (measured at the load balancer, from first byte in to
+        last byte out) is strictly less than 250 ms.
+        Only 2xx responses are eligible; errors are tracked by the
+        availability SLO.
+      metric: |
+        sum(rate(http_request_duration_seconds_bucket{
+          route="/v1/predict",
+          le="0.25",
+          status=~"2xx"
+        }[window]))
+        /
+        sum(rate(http_request_duration_seconds_count{
+          route="/v1/predict",
+          status=~"2xx"
+        }[window]))
+    objective: 0.95
+    window: 30d
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        annotation: "Fast burn: p95 latency breaching 250 ms at high rate. Page on-call."
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        annotation: "Latency SLO degrading over 6h window. Investigate replica health and Redis."
+
+  - name: latency_p99_sync
+    description: >
+      99% of synchronous /v1/predict requests must complete in under 500 ms.
+      The 500 ms threshold is also the external SLA refund trigger for p95,
+      so p99 breaches here are a leading indicator of SLA risk.
+    sli:
+      type: request_based
+      good_request: >
+        A synchronous POST /v1/predict request whose total end-to-end
+        latency is strictly less than 500 ms. Only 2xx responses counted.
+      metric: |
+        sum(rate(http_request_duration_seconds_bucket{
+          route="/v1/predict",
+          le="0.5",
+          status=~"2xx"
+        }[window]))
+        /
+        sum(rate(http_request_duration_seconds_count{
+          route="/v1/predict",
+          status=~"2xx"
+        }[window]))
+    objective: 0.99
+    window: 30d
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        annotation: "p99 latency burning fast. Risk of partner SLA breach within hours."
+      - severity: ticket
+        burn_rate: 3
+        window: 24h
+        annotation: "p99 slow burn. Review tail latency sources: Redis, batch-wait, GC."
+
+  - name: batch_availability
+    description: >
+      Tracks successful responses on the /v1/predict-batch endpoint.
+      Partners use this for bulk uploads; a lower objective reflects the
+      async-tolerant nature of batch workloads.
+    sli:
+      type: request_based
+      good_request: >
+        A POST /v1/predict-batch request that returns HTTP 200, regardless
+        of per-item success/error within the batch payload.
+        5xx responses and timeouts are bad. 4xx excluded from denominator.
+      metric: |
+        sum(rate(http_requests_total{route="/v1/predict-batch", status="200"}[window]))
+        /
+        sum(rate(http_requests_total{route="/v1/predict-batch", status!~"4xx"}[window]))
+    objective: 0.995
+    window: 30d
+    burn_rate_alerts:
+      - severity: page
+        burn_rate: 14.4
+        window: 1h
+        annotation: "Batch endpoint fast-burn availability drop. Page on-call."
+      - severity: ticket
+        burn_rate: 6
+        window: 6h
+        annotation: "Batch endpoint degraded. Check replica saturation and queue depth."
